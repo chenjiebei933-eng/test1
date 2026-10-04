@@ -1,0 +1,11 @@
+/.vscode/
+/artifacts/
+/build/
+/sdkconfig
+/sdkconfig.default
+/managed_components/
+__pycache__/
+*.pyc
+/tests/
+/tools/
+
