@@ -1,125 +1,57 @@
 #include "radar.h"
 
-#include "le_common.h"
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
-#include "asm/gpio.h"
-#include "asm/uart_dev.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 
-#include "stmgyro.h"
+#define RADAR_UART_PORT          UART_NUM_1
+#define RADAR_RX_GPIO            GPIO_NUM_18
+#define RADAR_BAUD_RATE          460800
+#define RADAR_RX_BUFFER_SIZE     4096
+#define RADAR_EVENT_QUEUE_SIZE   16
+#define RADAR_IDLE_TIMEOUT_MS    1000
+#define RADAR_STATUS_PERIOD_MS   2000
+#define RADAR_READ_SIZE          256
+#define RADAR_MAX_FRAME_SIZE     2048
+#define RADAR_FRAME_HEADER_SIZE  40
+#define RADAR_PACK_HEADER_SIZE   12
+#define RADAR_CLOUD_UNIT_SIZE    8
+#define RADAR_FLIGHT_UNIT_SIZE   14
+#define RADAR_TYPE_POINT_CLOUD   0x00000001U
+#define RADAR_TYPE_FLIGHT_PATH   0x00000003U
 
-#include "screen.h"
+static const char *TAG = "radar";
+static const uint8_t magic_header[8] = {
+    0x02, 0x01, 0x04, 0x03, 0x06, 0x05, 0x08, 0x07
+};
+static radar_event_callback_t radar_event_callback;
+static QueueHandle_t radar_uart_queue;
+static uint8_t radar_stream[RADAR_MAX_FRAME_SIZE];
+static size_t radar_stream_len;
 
+/* Only the receive task updates these counters. Report even when no valid
+ * packet arrives, so a silent input is distinguishable from a stopped app. */
+static struct {
+    uint32_t rx_bytes, frames, targets;
+    uint32_t breaks, frame_errors, parity_errors, overflows;
+    uint32_t last_frames;
+    TickType_t last_report;
+    uint8_t sample[16];
+    size_t sample_len;
+} radar_stats;
 
-#if LE_DEBUG_PRINT_EN
-//#define log_info            y_printf
-#define log_info(x, ...)  uprintf("[RADAR]" x " ", ## __VA_ARGS__)
-#define log_info_hexdump  put_buf
-
-#else
-#define log_info(...)
-#define log_info_hexdump(...)
-#endif
-
-static radar_event_callback_t redar_event_callback_handler = NULL;
-
-
-
-
-static int pyuart_init_gpio(void)
-{
-    gpio_set_pull_up(IO_PORTB_08, 1);
-    gpio_set_direction(IO_PORTB_08, 0);
-    gpio_write(IO_PORTB_08, 1);
-    
-    gpio_set_pull_up(IO_PORTB_09, 1);
-    gpio_set_direction(IO_PORTB_09, 0);
-    gpio_write(IO_PORTB_09, 1);
-
-    return 0;
-}
-
-#define UART_PORT           1
-// #define UART_RX_SIZE        0x100
-#define UART_TX_SIZE        256
-#define UART_DB_SIZE        2048
-#define UART_BAUD_RATE      115200
-
-// static u8 pRxBuffer_static[UART_RX_SIZE] __attribute__((aligned(4)));       //rx memory
-static u8 pTxBuffer_static[UART_TX_SIZE] __attribute__((aligned(4)));       //tx memory
-static u8 devBuffer_static[UART_DB_SIZE] __attribute__((aligned(4)));       //dev DMA memory
-
-static uart_bus_t *uart_bus = NULL;
-
-static void uart_isr_cb(void *ut_bus, u32 status);
-
-int radar_uart_init(void)
-{
-    struct uart_platform_data_t u_arg = {0};
-    u_arg.tx_pin = IO_PORTA_01;
-    u_arg.rx_pin = IO_PORTA_02;
-    u_arg.rx_cbuf = devBuffer_static;
-    u_arg.rx_cbuf_size = UART_DB_SIZE;
-    u_arg.frame_length = UART_DB_SIZE;
-    u_arg.rx_timeout = 20;  //ms,兼容波特率较低
-    u_arg.isr_cbfun = uart_isr_cb;
-    u_arg.baud = UART_BAUD_RATE;
-    u_arg.is_9bit = 0;
-
-    uart_bus = uart_dev_open(&u_arg, UART_PORT);
-
-    if (uart_bus != NULL) {
-        log_info("Init Done\n");
-        return 0;
-    } else {
-        log_info("Init Error\n");
-        return -1;
-    }
-
-    return 0;
-}
-
-int radar_uart_write(void)
-{
-    
-}
-
-#define RADAR_TYPE_POINT_CLOUD  0x00000001
-
-typedef uint64_t radar_cloud_unit_t;
-
-typedef struct __attribute__((aligned(1))) {
-    uint32_t type;
-    uint32_t length;
-    uint16_t num;
-    uint16_t xyzQFormat;
-    
-    // radar_cloud_unit_t *units;
-} radar_cloud_pack_t;
-
-
-#define RADAR_TYPE_FLIGHT_PATH  0x00000003
-
-typedef struct __attribute__((aligned(1))) {
-    int16_t x;
-    int16_t y;
-    int16_t xd;
-    int16_t yd;
-    int16_t xsize;
-    int16_t ysize;
-    uint8_t id;
-    uint8_t peakValdB;
-} radar_flight_unit_t;
-
-typedef struct __attribute__((aligned(1))) {
-    uint32_t type;
-    uint32_t length;
-    uint16_t num;
-    uint16_t xyzQFormat;
-} radar_flight_pack_t;
-
-
-
-typedef struct __attribute__((aligned(1))) {
+/* Wire layouts are unchanged; decode bytes explicitly to avoid alignment
+ * and native-endian assumptions when UART reads split fields. */
+typedef struct {
     uint8_t header[8];
     uint32_t version;
     uint32_t totalPacketLen;
@@ -131,154 +63,388 @@ typedef struct __attribute__((aligned(1))) {
     uint32_t subFrameNumber;
 } radar_frame_t;
 
-// Return Sizeof radar_cloud_point_t;
-static uint8_t *radar_unpackage_point_cloud(uint8_t *pdata)
+typedef struct {
+    uint32_t type;
+    uint32_t length;
+    uint16_t num;
+    uint16_t xyzQFormat;
+} radar_pack_t;
+
+typedef struct {
+    int16_t x;
+    int16_t y;
+    int16_t xd;
+    int16_t yd;
+    int16_t xsize;
+    int16_t ysize;
+    uint8_t id;
+    uint8_t peakValdB;
+} radar_flight_unit_t;
+
+static uint16_t radar_u16_le(const uint8_t *data)
 {
-    radar_cloud_pack_t pack = {0};
-    memcpy(&pack, pdata, sizeof(pack));
-    // log_info("Cloud Points:");
-    // log_info_hexdump(pdata + sizeof(pack), pack.num);
-    return pdata + sizeof(radar_cloud_pack_t) + pack.num * sizeof(radar_cloud_unit_t);
+    return (uint16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
 }
 
-static void *radar_copy_flight_path(radar_flight_unit_t *unit, uint8_t *pdata)
+static uint32_t radar_u32_le(const uint8_t *data)
 {
-    int16_t tmp = 0;
-
-    memcpy(&tmp, pdata, 2);
-    unit->x = tmp;
-    pdata += 2;
-    memcpy(&tmp, pdata, 2);
-    unit->y = tmp;
-    pdata += 2;
-    memcpy(&tmp, pdata, 2);
-    unit->xd = tmp;
-    pdata += 2;
-    memcpy(&tmp, pdata, 2);
-    unit->yd = tmp;
-    pdata += 2;
-    memcpy(&tmp, pdata, 2);
-    unit->xsize = tmp;
-    pdata += 2;
-    memcpy(&tmp, pdata, 2);
-    unit->ysize = tmp;
-    pdata += 2;
-    unit->id = *(pdata++);
-    unit->peakValdB = *(pdata++);
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8)
+           | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
 }
 
-
-static float radar_abs(float input)
+static int16_t radar_i16_le(const uint8_t *data)
 {
-    return input >= 0 ? input : -input;
+    const uint16_t raw = radar_u16_le(data);
+    const int32_t value = raw <= INT16_MAX ? (int32_t)raw : (int32_t)raw - 65536;
+    return (int16_t)value;
 }
 
-#define XRANGE_DANGER       2.5
-#define SECOND_DANGER       1
-
-#define XRANGE_WARNNING     5
-#define SECOND_WARNNING     3
-static void radar_approach_sense(int16_t x, int16_t y, int16_t dx, int16_t dy)
+static void radar_read_frame(radar_frame_t *frame, const uint8_t *data)
 {
-    if (dy >= 0)    // Will Not Touch Zero Line
-        return;
-    
-    float sec = (float)y / radar_abs(dy);
-    float zx  = (float)x / 128 + (float)dx / 128 * sec;
-
-    // ulog("<%d, %d>\r\n", (int)(sec * 1000), (int)(zx * 1000));
-
-    if (sec <= SECOND_DANGER && radar_abs(zx) <= XRANGE_DANGER) {
-        // Under Danger
-        screen_display(SCREEN_PRIORITY_RADAR_DANGER, PYUART_IMG_BREAK, 2000);       // TODO: 入侵警报入口 <<!!!>>
-    } else if (sec <= SECOND_WARNNING && radar_abs(zx) <= XRANGE_WARNNING) {
-        // Under Warning
-        screen_display(SCREEN_PRIORITY_RADAR_WARNNING, PYUART_IMG_WARNING, 2000);   // TODO: 入侵预警入口 <<!!!>>
-    }
+    memcpy(frame->header, data, sizeof(frame->header));
+    frame->version = radar_u32_le(data + 8);
+    frame->totalPacketLen = radar_u32_le(data + 12);
+    frame->platform = radar_u32_le(data + 16);
+    frame->frameNumber = radar_u32_le(data + 20);
+    frame->timeCpuCycles = radar_u32_le(data + 24);
+    frame->numDectedObj = radar_u32_le(data + 28);
+    frame->numTLVs = radar_u32_le(data + 32);
+    frame->subFrameNumber = radar_u32_le(data + 36);
 }
 
-static uint8_t *radar_unpackage_flight_path(uint8_t *pdata)
+static void radar_read_pack(radar_pack_t *pack, const uint8_t *data)
 {
-    radar_flight_pack_t pack = {0};
-    memcpy(&pack, pdata, sizeof(pack));
-
-    pdata += sizeof(pack);
-    for (int iunit = 0; iunit < pack.num; iunit++) {
-        radar_flight_unit_t unit = {0};
-        radar_copy_flight_path(&unit, pdata);
-        // ulog("(%d,%d,%d,%d)\r\n", unit.x, unit.y, unit.xd, unit.yd);
-        radar_approach_sense(unit.x, unit.y, unit.xd, unit.yd);
-        pdata += sizeof(radar_flight_unit_t);
-    }
-    return pdata;
+    pack->type = radar_u32_le(data);
+    pack->length = radar_u32_le(data + 4);
+    pack->num = radar_u16_le(data + 8);
+    pack->xyzQFormat = radar_u16_le(data + 10);
 }
 
-static const uint8_t magic_header[8] = { 0x02, 0x01, 0x04, 0x03, 0x06, 0x05, 0x08, 0x07 };
-static void radar_unpackage(uint8_t *pdata, uint16_t len)
+static void radar_copy_flight_path(radar_flight_unit_t *unit, const uint8_t *data)
 {
-    if (len < 40)
-        return ;
+    unit->x = radar_i16_le(data);
+    unit->y = radar_i16_le(data + 2);
+    unit->xd = radar_i16_le(data + 4);
+    unit->yd = radar_i16_le(data + 6);
+    unit->xsize = radar_i16_le(data + 8);
+    unit->ysize = radar_i16_le(data + 10);
+    unit->id = data[12];
+    unit->peakValdB = data[13];
+}
 
-    radar_frame_t frame = {0};
-    memcpy(&frame, pdata, sizeof(radar_frame_t));
-    if (0 != memcmp(frame.header, magic_header, 8)) {
-        log_info("Frame Magic Error\n");
-        return;
+/* Return false only for malformed frames, so the stream can search again
+ * from the next byte. An unsupported TLV ends this frame without targets. */
+static bool radar_unpackage(const uint8_t *data, size_t len)
+{
+    if (len < RADAR_FRAME_HEADER_SIZE
+        || memcmp(data, magic_header, sizeof(magic_header)) != 0) {
+        return false;
     }
 
-    if (frame.totalPacketLen != len) {
-        log_info("Frame Total Length Error\n");
-        return;
+    radar_frame_t frame;
+    radar_read_frame(&frame, data);
+    if (frame.totalPacketLen != len
+        || frame.numTLVs > (len - RADAR_FRAME_HEADER_SIZE) / RADAR_PACK_HEADER_SIZE) {
+        ESP_LOGW(TAG, "Invalid frame length or TLV count");
+        return false;
     }
 
-    // log_info("Frame Count: %d\n", frame.subFrameNumber);
-    uint8_t *pframe = pdata + sizeof(radar_frame_t);
-    for (int iframe = 0; iframe < 20/*frame.subFrameNumber*/; iframe++) {
-        uint32_t type = 0;
-        memcpy(&type, pframe, 4);
-        switch (type) {
+    /* Validate every known TLV before emitting any valid-frame/target data.
+     * As in the original parser, traversal uses num and the unit size.
+     * Do not reinterpret length or xyzQFormat, or trim flight targets to
+     * numDectedObj: the header can describe point-cloud detections instead. */
+    size_t offset = RADAR_FRAME_HEADER_SIZE;
+    for (uint32_t i = 0; i < frame.numTLVs; ++i) {
+        const size_t remaining = len - offset;
+        if (remaining < RADAR_PACK_HEADER_SIZE) {
+            ESP_LOGW(TAG, "Truncated TLV header");
+            return false;
+        }
+        radar_pack_t pack;
+        radar_read_pack(&pack, data + offset);
+        size_t unit_size;
+        switch (pack.type) {
             case RADAR_TYPE_POINT_CLOUD:
-                pframe = radar_unpackage_point_cloud(pframe);
+                unit_size = RADAR_CLOUD_UNIT_SIZE;
                 break;
             case RADAR_TYPE_FLIGHT_PATH:
-                pframe = radar_unpackage_flight_path(pframe);
+                unit_size = RADAR_FLIGHT_UNIT_SIZE;
                 break;
             default:
-                // log_info("Frame Sub Type Error: %d\n", type);
-                return;
+                ESP_LOGW(TAG, "Unsupported TLV type=%" PRIu32 "; skipping frame",
+                         pack.type);
+                return true;
+        }
+        if (pack.num > (remaining - RADAR_PACK_HEADER_SIZE) / unit_size) {
+            ESP_LOGW(TAG, "Truncated TLV targets");
+            return false;
+        }
+        offset += RADAR_PACK_HEADER_SIZE + (size_t)pack.num * unit_size;
+    }
+
+    ++radar_stats.frames;
+    ESP_LOGI(TAG, "frame=%" PRIu32 " objects=%" PRIu32 " tlvs=%" PRIu32,
+             frame.frameNumber, frame.numDectedObj, frame.numTLVs);
+
+    offset = RADAR_FRAME_HEADER_SIZE;
+    for (uint32_t i = 0; i < frame.numTLVs; ++i) {
+        radar_pack_t pack;
+        radar_read_pack(&pack, data + offset);
+        offset += RADAR_PACK_HEADER_SIZE;
+        if (pack.type == RADAR_TYPE_POINT_CLOUD) {
+            offset += (size_t)pack.num * RADAR_CLOUD_UNIT_SIZE;
+            continue;
+        }
+        for (uint16_t target = 0; target < pack.num; ++target) {
+            radar_flight_unit_t unit;
+            radar_copy_flight_path(&unit, data + offset);
+            ++radar_stats.targets;
+            ESP_LOGI(TAG, "id=%u x=%d y=%d xd=%d yd=%d", (unsigned)unit.id,
+                     (int)unit.x, (int)unit.y, (int)unit.xd, (int)unit.yd);
+            if (radar_event_callback != NULL) {
+                radar_event_callback(unit.x, unit.y, unit.xd, unit.yd);
+            }
+            offset += RADAR_FLIGHT_UNIT_SIZE;
+        }
+    }
+    return true;
+}
+
+static void radar_reset_stream(void)
+{
+    radar_stream_len = 0;
+}
+
+static void radar_drop_bytes(size_t count)
+{
+    radar_stream_len -= count;
+    if (radar_stream_len != 0) {
+        memmove(radar_stream, radar_stream + count, radar_stream_len);
+    }
+}
+
+static void radar_process_stream(void)
+{
+    while (radar_stream_len >= sizeof(magic_header)) {
+        size_t start = 0;
+        while (start + sizeof(magic_header) <= radar_stream_len
+               && memcmp(radar_stream + start, magic_header, sizeof(magic_header)) != 0) {
+            ++start;
+        }
+        /* Without a full magic word, retain the last seven bytes so a
+         * header split across UART reads can still be recognized. */
+        radar_drop_bytes(start);
+        if (radar_stream_len < 16) {
+            return;
+        }
+
+        const uint32_t packet_len = radar_u32_le(radar_stream + 12);
+        if (packet_len < RADAR_FRAME_HEADER_SIZE || packet_len > RADAR_MAX_FRAME_SIZE) {
+            ESP_LOGW(TAG, "Invalid packet length=%" PRIu32, packet_len);
+            radar_drop_bytes(1);
+            continue;
+        }
+        if (radar_stream_len < packet_len) {
+            return;
+        }
+        if (radar_unpackage(radar_stream, packet_len)) {
+            radar_drop_bytes(packet_len);
+        } else {
+            radar_drop_bytes(1);
         }
     }
 }
 
-static uint8_t package[2048] = {0};
-static void uart_isr_cb(void *ut_bus, u32 status)
+static void radar_feed(const uint8_t *data, size_t len)
 {
-    // struct sys_event e;
-    // printf("{##%d}", status);
-
-    if (status == UT_RX_OT) {
-        u32 len = uart_bus->read(package, 2048, 0);
-        // log_info("Radar Receive %d Byte Data\n", len);
-
-        // log_info_hexdump(package, len);
-        radar_unpackage(package, len);
+    while (len != 0) {
+        size_t available = sizeof(radar_stream) - radar_stream_len;
+        if (available == 0) {
+            /* Normally a full buffer is already parsed, because accepted
+             * totalPacketLen never exceeds the buffer. Recover defensively. */
+            ESP_LOGW(TAG, "Frame buffer full; resynchronizing");
+            radar_reset_stream();
+            available = sizeof(radar_stream);
+        }
+        const size_t count = len < available ? len : available;
+        memcpy(radar_stream + radar_stream_len, data, count);
+        radar_stream_len += count;
+        data += count;
+        len -= count;
+        radar_process_stream();
     }
-
-    // if (/*status == UT_RX || */status == UT_RX_OT) {
-    //     log_info("RECV OT\n");
-    //     u8 line[128] = {0};
-    //     log_info("%s\n", line);
-    // }
 }
 
-int radar_init(radar_event_callback_t handle)
+static void radar_handle_idle_timeout(void)
 {
-    redar_event_callback_handler = handle;
+    if (radar_stream_len == 0) {
+        return;
+    }
+    /* A 2048-byte frame takes about 45 ms at 460800/8N1, and generates
+     * receive events along the way. Only recover after a full second
+     * without events, never on UART_DATA.timeout_flag. Scan stale bytes
+     * for complete later frames before discarding incomplete remnants. */
+    ESP_LOGW(TAG, "Incomplete frame timeout; resynchronizing");
+    while (radar_stream_len != 0) {
+        radar_drop_bytes(1);
+        radar_process_stream();
+    }
+}
 
-    radar_uart_init();
-    pyuart_init_gpio();
+static void radar_reset_receiver(void)
+{
+    const esp_err_t err = uart_flush_input(RADAR_UART_PORT);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART flush failed: %s", esp_err_to_name(err));
+    }
+    if (radar_uart_queue != NULL) {
+        xQueueReset(radar_uart_queue);
+    }
+    radar_reset_stream();
+}
 
-    return 0;
+static void radar_handle_uart_event(const uart_event_t *event)
+{
+    switch (event->type) {
+        case UART_DATA: {
+            uint8_t data[RADAR_READ_SIZE];
+            size_t remaining = event->size;
+            while (remaining != 0) {
+                const size_t requested = remaining < sizeof(data) ? remaining : sizeof(data);
+                const int received = uart_read_bytes(RADAR_UART_PORT, data,
+                                                     (uint32_t)requested, 0);
+                if (received < 0) {
+                    ESP_LOGW(TAG, "UART read failed; resynchronizing");
+                    radar_reset_receiver();
+                    break;
+                }
+                if (received == 0) {
+                    break;
+                }
+                radar_stats.rx_bytes += (uint32_t)received;
+                const size_t space = sizeof(radar_stats.sample) - radar_stats.sample_len;
+                const size_t sample_size = (size_t)received < space ? (size_t)received : space;
+                memcpy(radar_stats.sample + radar_stats.sample_len, data, sample_size);
+                radar_stats.sample_len += sample_size;
+                radar_feed(data, (size_t)received);
+                remaining -= (size_t)received;
+            }
+            break;
+        }
+        case UART_FIFO_OVF:
+        case UART_BUFFER_FULL:
+        case UART_FRAME_ERR:
+        case UART_PARITY_ERR:
+        case UART_BREAK:
+            if (event->type == UART_BREAK) {
+                ++radar_stats.breaks;
+            } else if (event->type == UART_FRAME_ERR) {
+                ++radar_stats.frame_errors;
+            } else if (event->type == UART_PARITY_ERR) {
+                ++radar_stats.parity_errors;
+            } else {
+                ++radar_stats.overflows;
+            }
+            ESP_LOGW(TAG, "UART receive error=%d; resynchronizing", (int)event->type);
+            radar_reset_receiver();
+            break;
+        default:
+            break;
+    }
+}
+
+static void radar_report_status(void)
+{
+    const TickType_t now = xTaskGetTickCount();
+    if ((TickType_t)(now - radar_stats.last_report) < pdMS_TO_TICKS(RADAR_STATUS_PERIOD_MS)) {
+        return;
+    }
+    radar_stats.last_report = now;
+    ESP_LOGI(TAG, "status baud=%d rx_bytes=%" PRIu32 " frames=%" PRIu32
+             " targets=%" PRIu32 " break=%" PRIu32 " frame_err=%" PRIu32
+             " parity_err=%" PRIu32 " overflow=%" PRIu32 " rx_level=%d",
+             RADAR_BAUD_RATE, radar_stats.rx_bytes, radar_stats.frames,
+             radar_stats.targets, radar_stats.breaks, radar_stats.frame_errors,
+             radar_stats.parity_errors, radar_stats.overflows, gpio_get_level(RADAR_RX_GPIO));
+    if (radar_stats.frames == radar_stats.last_frames && radar_stats.sample_len != 0) {
+        char hex[sizeof(radar_stats.sample) * 3 + 1];
+        for (size_t i = 0; i < radar_stats.sample_len; ++i) {
+            snprintf(hex + i * 3, sizeof(hex) - i * 3, "%02X ", (unsigned)radar_stats.sample[i]);
+        }
+        ESP_LOGW(TAG, "RX sample (no decoded frame in interval): %s", hex);
+    }
+    radar_stats.last_frames = radar_stats.frames;
+    radar_stats.sample_len = 0;
+}
+
+static void radar_receive_task(void *argument)
+{
+    (void)argument;
+    uart_event_t event;
+    for (;;) {
+        if (xQueueReceive(radar_uart_queue, &event,
+                          pdMS_TO_TICKS(RADAR_IDLE_TIMEOUT_MS)) == pdTRUE) {
+            radar_handle_uart_event(&event);
+        } else {
+            radar_handle_idle_timeout();
+        }
+        radar_report_status();
+    }
+}
+
+esp_err_t radar_init(radar_event_callback_t handle)
+{
+    if (uart_is_driver_installed(RADAR_UART_PORT)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    radar_uart_queue = NULL;
+    radar_event_callback = NULL;
+    radar_reset_stream();
+    memset(&radar_stats, 0, sizeof(radar_stats));
+    radar_stats.last_report = xTaskGetTickCount();
+    esp_err_t err = uart_driver_install(RADAR_UART_PORT, RADAR_RX_BUFFER_SIZE,
+                                       0, RADAR_EVENT_QUEUE_SIZE, &radar_uart_queue, 0);
+    if (err != ESP_OK) {
+        radar_uart_queue = NULL;
+        return err;
+    }
+
+    const uart_config_t config = {
+        .baud_rate = RADAR_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    err = uart_param_config(RADAR_UART_PORT, &config);
+    if (err != ESP_OK) {
+        goto fail;
+    }
+    err = uart_set_pin(RADAR_UART_PORT, UART_PIN_NO_CHANGE, RADAR_RX_GPIO,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) {
+        goto fail;
+    }
+
+    radar_event_callback = handle;
+    if (xTaskCreate(radar_receive_task, "radar_rx", 4096, NULL, 5, NULL) != pdPASS) {
+        err = ESP_ERR_NO_MEM;
+        goto fail;
+    }
+    ESP_LOGI(TAG, "UART1 RX=GPIO18 %d baud 8N1; feedback on UART0 console", RADAR_BAUD_RATE);
+    return ESP_OK;
+
+fail:
+    radar_event_callback = NULL;
+    const esp_err_t cleanup_err = uart_driver_delete(RADAR_UART_PORT);
+    if (cleanup_err != ESP_OK) {
+        ESP_LOGE(TAG, "UART cleanup failed: %s", esp_err_to_name(cleanup_err));
+    }
+    radar_uart_queue = NULL;
+    radar_reset_stream();
+    return err;
 }
 
 
